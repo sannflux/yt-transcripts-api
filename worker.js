@@ -1,9 +1,10 @@
 /**
- * Cloudflare Worker: YouTube Transcript Fetcher (robust v4)
- * - watch HTML -> captionTracks -> baseUrl
- * - forces fmt=json3, parses JSON3 + XML
+ * Cloudflare Worker: YouTube Transcript Fetcher v5 (Innertube)
  *
  * GET /transcript?video_id=XXXXXXXXXXX&lang=en&debug=1
+ *
+ * Uses youtubei/v1/player to obtain captionTracks reliably (no HTML scraping).
+ * Then fetches the caption baseUrl (forces fmt=json3) and parses JSON3.
  */
 
 function corsHeaders(origin) {
@@ -45,36 +46,24 @@ function normalizeText(chunks) {
     .replace(/\s+/g, " ")
     .trim();
 }
-
 function looksLikeHtml(s) {
-  const t = String(s || "").slice(0, 500).toLowerCase();
+  const t = String(s || "").slice(0, 400).toLowerCase();
   return t.includes("<!doctype html") || t.includes("<html") || t.includes("consent.youtube.com");
 }
-function looksLikeJson(s) {
-  const t = String(s || "").trimStart();
-  return t.startsWith("{") || t.startsWith("[");
-}
-
 function ytHeaders() {
   return {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept":
-      "text/html,application/xhtml+xml,application/xml;q=0.9,text/xml;q=0.8,application/json;q=0.9,*/*;q=0.7",
+    "Accept": "application/json,text/plain,*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
+    "Origin": "https://www.youtube.com",
+    "Referer": "https://www.youtube.com/",
   };
 }
 
-// ---------- Parser: timedtext XML ----------
-function parseTimedTextXml(xml) {
-  const matches = [...String(xml).matchAll(/<text[^>]*>([\s\S]*?)<\/text>/gi)];
-  const chunks = matches.map((m) => m[1].replace(/<[^>]+>/g, " "));
-  return normalizeText(chunks);
-}
-
-// ---------- Parser: timedtext JSON3 ----------
+// ---- JSON3 timedtext parse ----
 function parseTimedTextJson3(jsonText) {
   try {
     const obj = JSON.parse(jsonText);
@@ -93,88 +82,72 @@ function parseTimedTextJson3(jsonText) {
   }
 }
 
-function parseTimedTextAuto(bodyText) {
-  const s = String(bodyText || "");
-  if (!s.trim()) return "";
-
-  if (looksLikeJson(s)) {
-    const t = parseTimedTextJson3(s);
-    if (t) return t;
-  }
-  if (s.includes("<text") && s.includes("</text>")) {
-    const t = parseTimedTextXml(s);
-    if (t) return t;
-  }
-  return "";
+function withFmtJson3(baseUrl) {
+  const u = new URL(baseUrl);
+  u.searchParams.set("fmt", "json3");
+  return u.toString();
 }
 
-// ---------- Method: watch HTML -> captionTracks ----------
-async function fetchWatchHtml(videoId) {
-  const url = `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US`;
-  const res = await fetch(url, { headers: ytHeaders() });
-  return { status: res.status, body: await res.text() };
+// ---- Innertube player call ----
+// This client config is commonly used for unauthenticated access.
+// It may change over time; if it breaks, we adjust clientVersion.
+const INNERTUBE_CLIENT = {
+  clientName: "WEB",
+  clientVersion: "2.20241219.01.00",
+  hl: "en",
+  gl: "US",
+};
+
+async function fetchPlayer(videoId) {
+  const endpoint = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+  const body = {
+    videoId,
+    context: { client: INNERTUBE_CLIENT },
+  };
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      ...ytHeaders(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text();
+  return { status: res.status, bodyText: text };
 }
 
-function extractCaptionTracksFromWatchHtml(htmlText) {
-  const s = String(htmlText || "");
-  const idx = s.indexOf('"captionTracks":');
-  if (idx === -1) return [];
-
-  const start = s.indexOf("[", idx);
-  if (start === -1) return [];
-
-  let depth = 0;
-  let end = -1;
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === "[") depth++;
-    else if (ch === "]") {
-      depth--;
-      if (depth === 0) {
-        end = i + 1;
-        break;
-      }
-    }
-  }
-  if (end === -1) return [];
-
-  const arrText = s.slice(start, end);
-
-  try {
-    const fixed = arrText
-      .replace(/\\u0026/g, "&")
-      .replace(/\\u003d/g, "=")
-      .replace(/\\u003c/g, "<")
-      .replace(/\\u003e/g, ">");
-
-    const arr = JSON.parse(fixed);
-    if (!Array.isArray(arr)) return [];
-    return arr
-      .map((t) => ({
-        baseUrl: t.baseUrl,
-        languageCode: t.languageCode,
-        kind: t.kind || null,
-        name: t?.name?.simpleText || null,
-      }))
-      .filter((t) => t.baseUrl && t.languageCode);
-  } catch {
-    return [];
-  }
+function extractCaptionTracksFromPlayer(playerObj) {
+  const tracks =
+    playerObj?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+  if (!Array.isArray(tracks)) return [];
+  return tracks
+    .map((t) => ({
+      baseUrl: t.baseUrl,
+      languageCode: t.languageCode,
+      kind: t.kind || null,
+      name: t?.name?.simpleText || null,
+    }))
+    .filter((t) => t.baseUrl && t.languageCode);
 }
 
-function pickCaptionTrack(tracks, preferredLang) {
+function pickTrack(tracks, preferredLang) {
   const p = (preferredLang || "en").toLowerCase();
 
+  // Prefer manual (no kind)
   let t =
     tracks.find((x) => (x.languageCode || "").toLowerCase() === p && !x.kind) ||
     tracks.find((x) => (x.languageCode || "").toLowerCase().startsWith(p) && !x.kind);
   if (t) return t;
 
+  // then any
   t =
     tracks.find((x) => (x.languageCode || "").toLowerCase() === p) ||
     tracks.find((x) => (x.languageCode || "").toLowerCase().startsWith(p));
   if (t) return t;
 
+  // fallback English
   t =
     tracks.find((x) => (x.languageCode || "").toLowerCase().startsWith("en") && !x.kind) ||
     tracks.find((x) => (x.languageCode || "").toLowerCase().startsWith("en"));
@@ -183,17 +156,9 @@ function pickCaptionTrack(tracks, preferredLang) {
   return tracks[0] || null;
 }
 
-function withFmtJson3(baseUrl) {
-  const u = new URL(baseUrl);
-  // Force JSON3 output if possible
-  u.searchParams.set("fmt", "json3");
-  return u.toString();
-}
-
 export default {
   async fetch(request) {
     const origin = request.headers.get("Origin") || "*";
-
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(origin) });
     }
@@ -219,51 +184,69 @@ export default {
     const log = (obj) => debug && logs.push(obj);
 
     try {
-      const watchRes = await fetchWatchHtml(videoId);
-      log({ method: "watch_html", status: watchRes.status, head: watchRes.body.slice(0, 160) });
+      const playerRes = await fetchPlayer(videoId);
+      log({ method: "player_post", status: playerRes.status, head: playerRes.bodyText.slice(0, 220) });
 
-      if (watchRes.status !== 200) {
+      if (playerRes.status !== 200) {
         return json(
-          { ok: false, video_id: videoId, error: "watch_fetch_failed", detail: `status=${watchRes.status}`, logs },
+          { ok: false, video_id: videoId, error: "player_fetch_failed", detail: `status=${playerRes.status}`, logs },
+          502,
+          origin
+        );
+      }
+      if (looksLikeHtml(playerRes.bodyText)) {
+        return json(
+          { ok: false, video_id: videoId, error: "player_returned_html", detail: "Player endpoint returned HTML", logs },
           502,
           origin
         );
       }
 
-      if (watchRes.body.toLowerCase().includes("consent.youtube.com")) {
+      let playerObj;
+      try {
+        playerObj = JSON.parse(playerRes.bodyText);
+      } catch (e) {
         return json(
-          { ok: false, video_id: videoId, error: "consent_interstitial", detail: "YouTube consent page", logs },
+          { ok: false, video_id: videoId, error: "player_json_parse_failed", detail: String(e), logs },
           502,
           origin
         );
       }
 
-      const capTracks = extractCaptionTracksFromWatchHtml(watchRes.body);
-      log({ method: "captionTracks_extracted", count: capTracks.length, sample: capTracks[0] || null });
+      // Sometimes status is "LOGIN_REQUIRED" or similar
+      const playStatus = playerObj?.playabilityStatus?.status;
+      log({ method: "playability", status: playStatus, reason: playerObj?.playabilityStatus?.reason || null });
 
-      if (!capTracks.length) {
+      const tracks = extractCaptionTracksFromPlayer(playerObj);
+      log({ method: "captionTracks_from_player", count: tracks.length, sample: tracks[0] || null });
+
+      if (!tracks.length) {
         return json(
-          { ok: false, video_id: videoId, error: "no_caption_tracks", detail: "No captionTracks found", logs },
+          {
+            ok: false,
+            video_id: videoId,
+            error: "no_caption_tracks",
+            detail: "No captionTracks available from player endpoint (video may have CC but restricted to logged-in or other client)",
+            logs,
+          },
           404,
           origin
         );
       }
 
-      const chosen = pickCaptionTrack(capTracks, lang);
-      log({ method: "captionTracks_chosen", chosen });
+      const chosen = pickTrack(tracks, lang);
+      log({ method: "chosen_track", chosen });
 
-      // Force JSON3
-      const json3Url = withFmtJson3(chosen.baseUrl);
-      log({ method: "caption_fetch_url", url: json3Url.slice(0, 180) + "..." });
+      const capUrl = withFmtJson3(chosen.baseUrl);
+      log({ method: "caption_fetch_url", head: capUrl.slice(0, 180) + "..." });
 
-      const capRes = await fetch(json3Url, { headers: ytHeaders() });
-      const capBody = await capRes.text();
-
+      const capRes = await fetch(capUrl, { headers: ytHeaders() });
+      const capText = await capRes.text();
       log({
-        method: "caption_baseUrl_fetch",
+        method: "caption_fetch",
         status: capRes.status,
         contentType: capRes.headers.get("content-type"),
-        head: capBody.slice(0, 260),
+        head: capText.slice(0, 260),
       });
 
       if (capRes.status !== 200) {
@@ -273,8 +256,7 @@ export default {
           origin
         );
       }
-
-      if (looksLikeHtml(capBody)) {
+      if (looksLikeHtml(capText)) {
         return json(
           { ok: false, video_id: videoId, error: "caption_fetch_returned_html", detail: "Caption fetch returned HTML", logs },
           502,
@@ -282,24 +264,8 @@ export default {
         );
       }
 
-      let text = parseTimedTextAuto(capBody);
-
-      // Fallback: if JSON3 forced but still empty, try original baseUrl (often XML)
-      if (!text || text.length < 20) {
-        const capRes2 = await fetch(chosen.baseUrl, { headers: ytHeaders() });
-        const capBody2 = await capRes2.text();
-        log({
-          method: "caption_baseUrl_fetch_fallback",
-          status: capRes2.status,
-          contentType: capRes2.headers.get("content-type"),
-          head: capBody2.slice(0, 260),
-        });
-        if (capRes2.status === 200 && !looksLikeHtml(capBody2)) {
-          text = parseTimedTextAuto(capBody2);
-        }
-      }
-
-      if (!text || text.length < 20) {
+      const transcript = parseTimedTextJson3(capText);
+      if (!transcript || transcript.length < 20) {
         return json(
           { ok: false, video_id: videoId, error: "empty_transcript", detail: "Parsed transcript empty/too short", logs },
           404,
@@ -308,7 +274,15 @@ export default {
       }
 
       return json(
-        { ok: true, video_id: videoId, lang: chosen.languageCode, kind: chosen.kind, length: text.length, text, logs },
+        {
+          ok: true,
+          video_id: videoId,
+          lang: chosen.languageCode,
+          kind: chosen.kind,
+          length: transcript.length,
+          text: transcript,
+          logs,
+        },
         200,
         origin
       );
