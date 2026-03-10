@@ -1,3 +1,5 @@
+const WORKER_VERSION = "INNERTUBE_V5_2026-03-10";
+
 /**
  * Cloudflare Worker: YouTube Transcript Fetcher v5 (Innertube)
  *
